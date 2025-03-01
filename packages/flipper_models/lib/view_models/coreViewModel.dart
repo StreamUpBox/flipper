@@ -7,6 +7,7 @@ import 'dart:developer';
 
 import 'package:flipper_models/helperModels/RwApiResponse.dart';
 import 'package:flipper_models/helperModels/random.dart';
+import 'package:flipper_models/isolateHandelr.dart';
 import 'package:flipper_models/realm_model_export.dart';
 import 'package:flipper_models/view_models/mixins/_transaction.dart';
 import 'package:flipper_services/constants.dart';
@@ -93,7 +94,7 @@ class CoreViewModel extends FlipperBaseModel
     _tab = tab;
   }
 
-  Future<bool> updateCategory({required Category category}) async {
+  Future<bool> updateCategoryCore({required Category category}) async {
     int branchId = ProxyService.box.getBranchId()!;
 
     try {
@@ -363,23 +364,9 @@ class CoreViewModel extends FlipperBaseModel
     app.loadCategories();
   }
 
-  ///list products availabe for sell
-  Future<List<Product>> products() async {
-    int branchId = ProxyService.box.getBranchId()!;
-    return await ProxyService.strategy.productsFuture(branchId: branchId);
-  }
-
   Business get businesses => app.business;
 
   Branch? get branch => app.branch;
-
-  // void pop() {
-  //   ProxyService.keypad.pop();
-  // }
-
-  // void reset() {
-  //   ProxyService.keypad.reset();
-  // }
 
   Future<void> handleCustomQtySetBeforeSelectingVariation() async {
     ProxyService.keypad.decreaseQty();
@@ -942,7 +929,7 @@ class CoreViewModel extends FlipperBaseModel
         ProxyService.strategy.updateTransaction(
           transaction: pendingTransaction,
           status: PARKED,
-          sarTyCd: "6",
+          sarTyCd: "2", //Incoming- Purchase
           receiptNumber: randomNumber(),
           reference: randomNumber().toString(),
           invoiceNumber: randomNumber(),
@@ -976,6 +963,7 @@ class CoreViewModel extends FlipperBaseModel
           if (variant != null) {
             await ProxyService.strategy.updateStock(
                 stockId: variant.stock!.id,
+                appending: true,
                 rsdQty: variantFromPurchase.stock!.currentStock,
                 initialStock: variantFromPurchase.stock!.currentStock,
                 currentStock: variantFromPurchase.stock!.currentStock,
@@ -1006,22 +994,118 @@ class CoreViewModel extends FlipperBaseModel
     }
   }
 
-  Future<void> acceptAllImport(List<Variant> finalItemList) async {
+  Future<void> approveAllImportItems(List<Variant> importItems) async {
     try {
-      isLoading = true;
-      notifyListeners();
+      setBusy(true);
 
-      for (Variant item in finalItemList) {
-        await ProxyService.tax.updateImportItems(
-            item: item, URI: await ProxyService.box.getServerUrl() ?? "");
+      for (final item in importItems) {
+        // Only process items that are still waiting for approval
+        if (item.imptItemSttsCd == "2") {
+          // "2" likely means "Waiting Approval"
+          item.imptItemSttsCd = "3";
+          item.taxName = "B";
+          item.taxTyCd = "B";
+          item.ebmSynced = false;
+
+          await ProxyService.strategy.updateVariant(updatables: [item]);
+
+          final URI = await ProxyService.box.getServerUrl();
+
+          await ProxyService.tax.updateImportItems(
+            item: item,
+            URI: URI ?? "",
+          );
+          final pendingTransaction =
+              await ProxyService.strategy.manageTransaction(
+            transactionType: TransactionType.adjustment,
+            isExpense: true,
+            branchId: ProxyService.box.getBranchId()!,
+          );
+          Business? business = await ProxyService.strategy
+              .getBusiness(businessId: ProxyService.box.getBusinessId()!);
+
+          await assignTransaction(
+            variant: item,
+            pendingTransaction: pendingTransaction!,
+            business: business!,
+            randomNumber: randomNumber(),
+            // 06 is incoming import.
+            sarTyCd: "01",
+          );
+          await completeTransaction(pendingTransaction: pendingTransaction);
+
+          item.ebmSynced = true;
+          await ProxyService.strategy
+              .updateVariant(updatables: [item]); // Ensure update is awaited.
+        }
       }
+      notifyListeners(); // Trigger UI update if needed
+    } catch (e, s) {
+      talker.error(s);
+      setError(e); // Set an error state in your ViewModel
+    } finally {
+      setBusy(false); // Ensure busy state is cleared
+    }
+  }
 
-      isLoading = false;
-      notifyListeners();
+  Future<void> approveImportItem(Variant item) async {
+    try {
+      item.imptItemSttsCd = "3";
+      //TODO: on import give a user to set this.
+      item.taxName = "B";
+      item.taxTyCd = "B";
+      item.ebmSynced = false;
+      await ProxyService.strategy.updateVariant(updatables: [item]);
+
+      final URI = await ProxyService.box.getServerUrl();
+
+      await ProxyService.tax.updateImportItems(
+        item: item,
+        URI: URI ?? "",
+      );
+
+      final pendingTransaction = await ProxyService.strategy.manageTransaction(
+        transactionType: TransactionType.adjustment,
+        isExpense: true,
+        branchId: ProxyService.box.getBranchId()!,
+      );
+      Business? business = await ProxyService.strategy
+          .getBusiness(businessId: ProxyService.box.getBusinessId()!);
+
+      await assignTransaction(
+        variant: item,
+        pendingTransaction: pendingTransaction!,
+        business: business!,
+        randomNumber: randomNumber(),
+        // 06 is incoming import.
+        sarTyCd: "01",
+      );
+
+      await completeTransaction(pendingTransaction: pendingTransaction);
+
+      item.ebmSynced = true;
+      ProxyService.strategy.updateVariant(updatables: [item]);
+    } catch (e, s) {
+      talker.error(s);
+      rethrow; // Re-throw the exception to be caught in the UI
+    }
+  }
+
+  Future<void> rejectImportItem(Variant item) async {
+    try {
+      item.imptItemSttsCd = "4";
+      item.ebmSynced = false;
+      await ProxyService.strategy.updateVariant(updatables: [item]);
+
+      await ProxyService.tax.updateImportItems(
+        item: item,
+        URI: await ProxyService.box.getServerUrl() ?? "",
+      );
+
+      item.ebmSynced = true;
+      ProxyService.strategy.updateVariant(updatables: [item]);
     } catch (e) {
-      isLoading = false;
-      notifyListeners();
-      throw Exception("Internal error, could not save import items");
+      rethrow; // Re-throw the exception to be caught in the UI
     }
   }
 }
